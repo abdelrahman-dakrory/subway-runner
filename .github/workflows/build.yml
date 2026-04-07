@@ -13,11 +13,15 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y python3-pip build-essential git \
             libsdl2-dev libsdl2-image-dev libsdl2-mixer-dev \
-            libsdl2-ttf-dev libportmidi-dev zlib1g-dev
+            libsdl2-ttf-dev libportmidi-dev zlib1g-dev \
+            openjdk-17-jdk unzip
           pip install buildozer cython
-      - name: Accept Android licenses
-        run: yes | sdkmanager --licenses || true
-
+      - name: Accept licenses
+        run: |
+          mkdir -p $HOME/.android
+          echo "count=0" > $HOME/.android/repositories.cfg
+          yes | $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager --licenses || true
+          $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager "build-tools;33.0.0" "platforms;android-33"
       - name: Build APK
         run: buildozer -v android debug
       - name: Upload APK
