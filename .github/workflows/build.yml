@@ -4,29 +4,25 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v3
       - uses: actions/setup-python@v4
         with:
           python-version: '3.10'
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y python3-pip build-essential git \
+          sudo apt-get install -y \
+            python3-pip build-essential git \
             libsdl2-dev libsdl2-image-dev libsdl2-mixer-dev \
             libsdl2-ttf-dev libportmidi-dev zlib1g-dev \
-            openjdk-17-jdk unzip
+            openjdk-17-jdk unzip autoconf libtool pkg-config
           pip install buildozer cython
-      - name: Accept licenses
-        run: |
-          mkdir -p $HOME/.android
-          echo "count=0" > $HOME/.android/repositories.cfg
-          yes | $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager --licenses || true
-          $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager "build-tools;33.0.0" "platforms;android-33"
       - name: Build APK
-        run: buildozer -v android debug
+        env:
+          JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
+        run: yes | buildozer android debug
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: subway-runner-apk
           path: bin/*.apk
-          
