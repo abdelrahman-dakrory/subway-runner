@@ -15,6 +15,9 @@ jobs:
             libsdl2-dev libsdl2-image-dev libsdl2-mixer-dev \
             libsdl2-ttf-dev libportmidi-dev zlib1g-dev
           pip install buildozer cython
+      - name: Accept Android licenses
+        run: yes | sdkmanager --licenses || true
+
       - name: Build APK
         run: buildozer -v android debug
       - name: Upload APK
