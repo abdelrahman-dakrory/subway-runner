@@ -16,4 +16,4 @@ android.ndk = 25b
 android.archs = arm64-v8a
 
 [buildozer]
-log_level = 2
+log_level = 1
