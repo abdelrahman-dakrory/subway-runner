@@ -12,10 +12,26 @@ jobs:
         uses: actions/checkout@v3
 
       - name: Install dependencies
-        run: |
-          sudo apt update
-          sudo apt install -y python3-pip git zip unzip openjdk-17-jdk
+  run: |
+    sudo apt update
+    sudo apt install -y python3-pip git zip unzip openjdk-17-jdk
+- name: Install Android SDK
+  run: |
+    mkdir -p $HOME/android-sdk/cmdline-tools
+    cd $HOME/android-sdk/cmdline-tools
+    curl -o tools.zip https://dl.google.com/android/repository/commandlinetools-linux-9477386_latest.zip
+    unzip tools.zip
+    mv cmdline-tools latest
 
+    yes | $HOME/android-sdk/cmdline-tools/latest/bin/sdkmanager --licenses
+
+    $HOME/android-sdk/cmdline-tools/latest/bin/sdkmanager \
+      "platform-tools" \
+      "platforms;android-33" \
+      "build-tools;33.0.2"
+
+    echo "ANDROID_HOME=$HOME/android-sdk" >> $GITHUB_ENV
+    echo "PATH=$HOME/android-sdk/platform-tools:$HOME/android-sdk/cmdline-tools/latest/bin:$PATH" >> $GITHUB_ENV
       - name: Install Buildozer
         run: |
           pip install buildozer
