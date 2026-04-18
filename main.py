@@ -3,7 +3,7 @@
 #   Fixes: orientation, shop, menu text,
 #          35 skins (+ 10 rolling balls)
 # ═══════════════════════════════════════
-import random, math, json, os, time
+import random, math, json, os, time, wave, struct
 from kivy.app import App
 from kivy.uix.widget import Widget
 from kivy.uix.floatlayout import FloatLayout
@@ -18,6 +18,7 @@ from kivy.graphics import (Color, Ellipse, Rectangle, Line,
                             PushMatrix, PopMatrix, Scale, Translate, Rotate)
 from kivy.clock import Clock
 from kivy.core.window import Window
+from kivy.core.audio import SoundLoader
 
 W = Window.width
 H = Window.height
@@ -98,20 +99,83 @@ SK = [
 
 # ── Save / Load ───────────────────────
 SF = "sr_save.json"
+SOUND_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sr_sfx")
 
-def save(ct, hs, ski, ow):
+def _clamp16(v):
+    return max(-32767, min(32767, int(v)))
+
+def _write_tone(path, seq, volume=.42, sample_rate=22050):
+    frames=[]
+    for freq,dur,wave_type in seq:
+        count=max(1,int(sample_rate*dur))
+        for i in range(count):
+            t=i/sample_rate
+            if wave_type=="square":
+                base=1.0 if math.sin(2*math.pi*freq*t)>=0 else -1.0
+            elif wave_type=="noise":
+                base=random.uniform(-1,1)*(1-(i/max(1,count-1)))
+            else:
+                base=math.sin(2*math.pi*freq*t)
+            attack=max(1,int(count*.08))
+            release=max(1,int(count*.18))
+            env=min(1.0, i/attack, (count-i)/release)
+            frames.append(_clamp16(base*32767*volume*env))
+    with wave.open(path,'wb') as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(b''.join(struct.pack('<h',f) for f in frames))
+
+def ensure_sfx():
+    os.makedirs(SOUND_DIR, exist_ok=True)
+    specs={
+        "button":   [(740,.05,"square")],
+        "pause":    [(520,.06,"square"),(390,.07,"square")],
+        "coin":     [(1100,.05,"sine"),(1450,.06,"sine")],
+        "red_coin": [(720,.05,"square"),(980,.05,"square"),(1280,.06,"square")],
+        "powerup":  [(540,.05,"sine"),(760,.05,"sine"),(980,.08,"sine")],
+        "hit":      [(160,.10,"square"),(95,.12,"noise")],
+        "gameover": [(420,.08,"square"),(260,.11,"square"),(160,.16,"sine")],
+    }
+    out={}
+    for name,seq in specs.items():
+        p=os.path.join(SOUND_DIR,f"{name}.wav")
+        if not os.path.exists(p):
+            _write_tone(p,seq)
+        out[name]=p
+    return out
+
+def save(ct, hs, ski, ow, vol=None, muted=None):
     try:
+        prev_vol=1.0
+        prev_muted=False
+        if os.path.exists(SF):
+            try:
+                prev=json.loads(open(SF).read())
+                prev_vol=float(prev.get("v",1.0))
+                prev_muted=bool(prev.get("m",False))
+            except:
+                pass
+        if vol is None: vol=prev_vol
+        if muted is None: muted=prev_muted
         with open(SF,"w") as f:
-            json.dump({"c":ct,"h":hs,"s":ski,"o":list(ow)},f)
+            json.dump({"c":ct,"h":hs,"s":ski,"o":list(ow),"v":vol,"m":muted},f)
     except: pass
 
 def load():
     try:
         if os.path.exists(SF):
             d = json.loads(open(SF).read())
-            return d.get("c",0),d.get("h",0),d.get("s",0),set(d.get("o",[0]))
+            return (
+                d.get("c",0),
+                d.get("h",0),
+                d.get("s",0),
+                set(d.get("o",[0])),
+                float(d.get("v",1.0)),
+                bool(d.get("m",False)),
+            )
     except: pass
-    return 0,0,0,{0}
+    return 0,0,0,{0},1.0,False
 
 
 # ═══════════════════════════════════════
@@ -438,7 +502,7 @@ class GameCanvas(DrawMixin, Widget):
         super().__init__(**kw)
         self.app=app_ref
         self.size=(W,H); self.pos=(0,0)
-        ct,hs,ski,ow=load()
+        ct,hs,ski,ow,_,_=load()
         self.ct=ct; self.hs=hs; self.ski=ski; self.ow=ow
         self._reset(); self._job=None
 
@@ -450,6 +514,8 @@ class GameCanvas(DrawMixin, Widget):
         self.cl=1; self.tl=1
         self.px=float(LANES[1]-PW//2)
         self.lfl=0; self.efl=0; self.rc=0
+        self.run_coins=0
+        self.paused=False
         self.sty=0.0
         self.ball_angle=0.0          # rolling angle for ball skins
         self.iu=self.su=self.slu=self.rsu=0
@@ -470,12 +536,24 @@ class GameCanvas(DrawMixin, Widget):
     def stop(self):
         if self._job: self._job.cancel(); self._job=None
 
+    def pause(self):
+        if self.paused: return
+        self.paused=True
+        if self._job: self._job.cancel(); self._job=None
+
+    def resume(self):
+        if not self.paused: return
+        self.paused=False
+        if not self._job:
+            self._job=Clock.schedule_interval(self._upd,1/60)
+
     # ── Touch ──────────────────────────
     def on_touch_down(self,t):
+        if self.paused: return True
         self.touch_x=t.x; self.touch_y=t.y; return True
 
     def on_touch_up(self,t):
-        if self.touch_x is None: return True
+        if self.paused or self.touch_x is None: return True
         dx=t.x-self.touch_x; dy=t.y-self.touch_y
         if abs(dx)>abs(dy) and abs(dx)>W*.05:
             if dx<0 and self.tl>0:   self.tl-=1
@@ -501,6 +579,7 @@ class GameCanvas(DrawMixin, Widget):
     #   UPDATE  (game logic — unchanged)
     # ═══════════════════════════════════
     def _upd(self,dt):
+        if self.paused: return
         n=self._ms()
         hs=n<self.su; hrs=n<self.rsu; hsl=n<self.slu; inv=n<self.iu
         spd=self.ospd*(.4 if hsl else 1)
@@ -580,10 +659,12 @@ class GameCanvas(DrawMixin, Widget):
             if math.hypot(pcx-c["x"],pcy-c["y"])<self.CR+W*.037:
                 self.coins.remove(c)
                 if c["k"]=="g":
-                    self.ct+=1; self.sc+=50
+                    self.ct+=1; self.sc+=50; self.run_coins+=1
+                    if hasattr(self,'app') and self.app: self.app.play_sfx('coin')
                     self.canim.append({"x":c["x"],"y":c["y"],"al":255,"vy":0,"k":"g"})
                 else:
                     self.rc+=1
+                    if hasattr(self,'app') and self.app: self.app.play_sfx('red_coin')
                     self.canim.append({"x":c["x"],"y":c["y"],"al":255,"vy":0,"k":"r"})
                     if self.rc>=5:
                         self.rc=0
@@ -593,6 +674,7 @@ class GameCanvas(DrawMixin, Widget):
         for p in self.pups[:]:
             if math.hypot(pcx-p["x"],pcy-p["y"])<self.PR+W*.037:
                 self.pups.remove(p)
+                if hasattr(self,'app') and self.app: self.app.play_sfx('powerup')
                 if p["k"]=="s": self.su=n+15000
                 else:           self.slu=n+1500
 
@@ -607,9 +689,11 @@ class GameCanvas(DrawMixin, Widget):
                 if (pxi<o["x"]+o["w"]-inf and pxi+PW>o["x"]+inf and
                     PY <o["y"]+o["h"]-inf and PY+PH >o["y"]+inf):
                     self.lv-=1; self.iu=n+3000; self.efl=20
+                    if hasattr(self,'app') and self.app: self.app.play_sfx('hit')
                     if self.lv<=0:
                         self.hs=max(self.hs,self.sc)
                         save(self.ct,self.hs,self.ski,self.ow)
+                        if hasattr(self,'app') and self.app: self.app.play_sfx('gameover')
                         self.stop()
                         Clock.schedule_once(lambda dt:self.app.show_gameover(
                             self.sc,self.hs,self.ct,self.ski,self.ow),0)
@@ -745,6 +829,44 @@ def mk_lbl_outline(text,font_size,fg=(1,1,1,1)):
                  size_hint=(1,None),height=int(font_size*1.6))
 
 
+class SoundToggleButton(Button):
+    def __init__(self, app_ref, **kw):
+        super().__init__(**kw)
+        self.app=app_ref
+        self.text=""
+        self.background_normal=''
+        self.background_down=''
+        self.background_color=(0,0,0,0)
+        self.border=(0,0,0,0)
+        self.bind(pos=self._redraw,size=self._redraw)
+        self.bind(on_press=self._on_press)
+        Clock.schedule_once(lambda dt:self._redraw(),0)
+
+    def _on_press(self,*_):
+        self.app.toggle_mute()
+        self._redraw()
+
+    def _redraw(self,*_):
+        self.canvas.before.clear()
+        self.canvas.after.clear()
+        x,y=self.pos; w,h=self.size
+        r=max(12,int(min(w,h)*.28))
+        with self.canvas.before:
+            Color(0,0,0,.55)
+            RoundedRectangle(pos=(x,y),size=(w,h),radius=[r])
+        with self.canvas.after:
+            Color(1,1,1,1)
+            bx=x+w*.2; by=y+h*.36; bw=w*.16; bh=h*.28
+            Rectangle(pos=(bx,by),size=(bw,bh))
+            Triangle(points=[bx+bw, y+h*.28, bx+bw, y+h*.72, x+w*.54, y+h*.5])
+            if getattr(self.app,'sound_muted',False):
+                Line(points=[x+w*.63,y+h*.33,x+w*.84,y+h*.67],width=2.8)
+                Line(points=[x+w*.84,y+h*.33,x+w*.63,y+h*.67],width=2.8)
+            else:
+                Line(circle=(x+w*.63,y+h*.5,w*.09,-35,35),width=2.2)
+                Line(circle=(x+w*.68,y+h*.5,w*.15,-35,35),width=2.2)
+
+
 # ═══════════════════════════════════════
 #   MENU PLAYER PREVIEW  (animated)
 # ═══════════════════════════════════════
@@ -815,8 +937,17 @@ class MenuScreen(Screen):
         t1=mk_lbl("SUBWAY",int(H*.07),color=(*CYAN[:3],1)); t1.pos=(0,H*.82); layout.add_widget(t1)
         t2=mk_lbl("RUNNER",int(H*.07),color=(*YEL[:3],1));  t2.pos=(0,H*.74); layout.add_widget(t2)
 
+        btn_w=int(W*.14); btn_h=int(H*.055)
+        self.sound_btn=SoundToggleButton(
+            self.app,
+            size_hint=(None,None),
+            size=(btn_w,btn_h),
+            pos=(int(W*.03), H-btn_h-int(H*.02))
+        )
+        layout.add_widget(self.sound_btn)
+
         # Animated player preview
-        ct,hs,ski,_=load()
+        ct,hs,ski,_,_,_=load()
         self._pw=MenuPlayerWidget(ski,size=(W,int(PH*1.8)),pos=(0,int(H*.06)))
         layout.add_widget(self._pw)
         self._pw.start()
@@ -836,12 +967,17 @@ class MenuScreen(Screen):
         sb.pos=(W*.2,H*.19); layout.add_widget(sb)
 
         # FIX: Version/Author — white text with black outline, no white rectangle
-        vl=mk_lbl_outline("4.0.1 V2",int(H*.018)); vl.pos=(0,int(H*.037)); layout.add_widget(vl)
+        vl=mk_lbl_outline("V2_4.0.3",int(H*.018)); vl.pos=(0,int(H*.037)); layout.add_widget(vl)
         al=mk_lbl_outline("BY: Abdelrahman Dakrory  (⁠^_^)",int(H*.018)); al.pos=(0,int(H*.010)); layout.add_widget(al)
 
         self.add_widget(layout)
 
     def on_pre_enter(self): self._build()
+
+    def refresh_sound_button(self):
+        if getattr(self,'sound_btn',None):
+            self.sound_btn._redraw()
+
     def on_leave(self):
         if self._pw: self._pw.stop()
 
@@ -874,15 +1010,82 @@ class GameScreen(Screen):
         for lb in[self.lbl_score,self.lbl_best,self.lbl_lv,self.lbl_coins,
                   self.lbl_shield,self.lbl_lvflash,self.lbl_red]:
             self.layout.add_widget(lb)
+        self.btn_pause=Button(text="II",font_size=int(H*.022),bold=True,
+                              background_normal='',background_color=(.32,.32,.32,.92),
+                              color=(1,1,1,1),size_hint=(None,None),
+                              size=(int(W*.1),int(H*.038)),
+                              pos=(W-int(W*.15),H-int(H*.15)))
+        self.btn_pause.bind(on_press=self.pause_game)
+        self.layout.add_widget(self.btn_pause)
+        self.pause_overlay=None
         self.anim_lbls=[]
 
     def start(self,ski,ow,ct,hs):
+        if self.pause_overlay and self.pause_overlay.parent:
+            self.layout.remove_widget(self.pause_overlay)
+        self.pause_overlay=None
+        self.btn_pause.disabled=False
+        self.btn_pause.opacity=1
         if self.gc:
             self.gc.stop(); self.layout.remove_widget(self.gc)
         self.gc=GameCanvas(self.app)
         self.gc.ski=ski; self.gc.ow=ow; self.gc.ct=ct; self.gc.hs=hs
         self.layout.add_widget(self.gc,index=len(self.layout.children))
         self.gc.start()
+
+    def pause_game(self,*_):
+        if not self.gc or self.gc.paused: return
+        self.gc.pause()
+        self.app.play_sfx('pause')
+        self.btn_pause.disabled=True
+        self.btn_pause.opacity=0
+        if self.pause_overlay and self.pause_overlay.parent:
+            self.layout.remove_widget(self.pause_overlay)
+        self.pause_overlay=self._build_pause_overlay()
+        self.layout.add_widget(self.pause_overlay)
+
+    def resume_game(self,*_):
+        if self.pause_overlay and self.pause_overlay.parent:
+            self.layout.remove_widget(self.pause_overlay)
+        self.pause_overlay=None
+        self.btn_pause.disabled=False
+        self.btn_pause.opacity=1
+        if self.gc: self.gc.resume()
+        self.app.play_sfx('button')
+
+    def _build_pause_overlay(self):
+        overlay=FloatLayout(size=(W,H))
+        with overlay.canvas.before:
+            Color(0,0,0,.7); Rectangle(pos=(0,0),size=(W,H))
+            cw=int(W*.83); ch=int(H*.38); cx=(W-cw)//2; cy=(H-ch)//2
+            Color(.08,.08,.16,.9); RoundedRectangle(pos=(cx,cy),size=(cw,ch),radius=[30])
+            Color(*RED); Line(rounded_rectangle=(cx,cy,cw,ch,30),width=5)
+        cw=int(W*.83); ch=int(H*.38); cx=(W-cw)//2; cy=(H-ch)//2
+        title=mk_lbl("PAUSED",int(H*.055),color=(*RED[:3],1))
+        title.pos=(0,cy+ch-int(H*.075)); overlay.add_widget(title)
+        for i,(txt,col) in enumerate([
+            (f"Coins Collected: {self.gc.run_coins}",(*GOLD[:3],1)),
+            (f"Score: {self.gc.sc}",(1,1,1,1)),
+        ]):
+            lbl=mk_lbl(txt,int(H*.03),color=col)
+            lbl.pos=(0,cy+ch-int(H*.14)-i*int(H*.042))
+            overlay.add_widget(lbl)
+        cont=mk_btn("Continue",(*GREEN[:3],1),self.resume_game,
+                    size_hint=(.6,None),height=int(H*.055),font_size=int(H*.028))
+        cont.pos=(W*.2,cy+int(H*.085)); overlay.add_widget(cont)
+        menu=mk_btn("Main Menu",(.35,.35,.35,1),self.go_menu_from_pause,
+                    size_hint=(.6,None),height=int(H*.044),font_size=int(H*.022))
+        menu.pos=(W*.2,cy-int(H*-.02)); overlay.add_widget(menu)
+        return overlay
+
+    def go_menu_from_pause(self,*_):
+        if self.gc:
+            self.app.ct=self.gc.ct
+            self.app.ski=self.gc.ski
+            self.app.ow=self.gc.ow
+            save(self.app.ct,self.app.hs,self.app.ski,self.app.ow)
+        self.app.play_sfx('button')
+        self.app.go_menu()
 
     def update_hud(self,sc,hs,ct,lvl,has_s,has_rs,has_sl,lfl,rc,canim):
         self.lbl_score.text=f"Score: {sc}"
@@ -901,6 +1104,11 @@ class GameScreen(Screen):
             self.lbl_lvflash.text=""
 
     def on_leave(self):
+        if self.pause_overlay and self.pause_overlay.parent:
+            self.layout.remove_widget(self.pause_overlay)
+        self.pause_overlay=None
+        self.btn_pause.disabled=False
+        self.btn_pause.opacity=1
         if self.gc: self.gc.stop()
 
 
@@ -1054,7 +1262,7 @@ size_hint_y=None)
         return card
 
     def on_pre_enter(self):
-        ct,hs,ski,ow=load()
+        ct,hs,ski,ow,_,_=load()
         self.build(ct,hs,ski,ow)
 
 
@@ -1064,7 +1272,21 @@ size_hint_y=None)
 class SubwayRunnerApp(App):
     def build(self):
         Window.clearcolor=(0,0,0,1)
-        self.ct,self.hs,self.ski,self.ow=load()
+        self.ct,self.hs,self.ski,self.ow,self.master_volume,self.sound_muted=load()
+        self.master_volume=max(0.0,min(1.5,self.master_volume))
+        self.base_sfx_volumes={
+            "button":.55,
+            "pause":.55,
+            "coin":.55,
+            "red_coin":.15,
+            "powerup":.55,
+            "hit":.55,
+            "gameover":.5,
+        }
+        self.sfx={}
+        for name,path in ensure_sfx().items():
+            self.sfx[name]=SoundLoader.load(path)
+        self._apply_sound_settings()
         self.sm=ScreenManager(transition=NoTransition())
 
         self.menu_scr=MenuScreen(self,name='menu')
@@ -1080,7 +1302,43 @@ class SubwayRunnerApp(App):
         self.sm.current='menu'
         return self.sm
 
+    def _apply_sound_settings(self):
+        mult=0.0 if self.sound_muted else self.master_volume
+        for name,snd in getattr(self,'sfx',{}).items():
+            if snd:
+                snd.volume=max(0.0,min(1.0,self.base_sfx_volumes.get(name,.75)*mult))
+
+    def set_master_volume(self,value):
+        self.master_volume=max(0.0,min(1.5,float(value)))
+        self.sound_muted=(self.master_volume<=0)
+        self._apply_sound_settings()
+        save(self.ct,self.hs,self.ski,self.ow,self.master_volume,self.sound_muted)
+        if hasattr(self,'menu_scr') and self.menu_scr:
+            self.menu_scr.refresh_sound_button()
+
+    def change_volume(self,delta):
+        self.set_master_volume(self.master_volume+delta)
+
+    def toggle_mute(self):
+        self.sound_muted=not self.sound_muted
+        self._apply_sound_settings()
+        save(self.ct,self.hs,self.ski,self.ow,self.master_volume,self.sound_muted)
+        if hasattr(self,'menu_scr') and self.menu_scr:
+            self.menu_scr.refresh_sound_button()
+        if not self.sound_muted:
+            self.play_sfx('button')
+
+    def play_sfx(self,name):
+        snd=getattr(self,'sfx',{}).get(name)
+        if not snd: return
+        try:
+            snd.stop()
+            snd.play()
+        except:
+            pass
+
     def start_game(self,ski=None,ow=None,ct=None,hs=None):
+        self.play_sfx('button')
         if ski is None: ski=self.ski
         if ow  is None: ow=self.ow
         if ct  is None: ct=self.ct
@@ -1096,7 +1354,12 @@ class SubwayRunnerApp(App):
 
     def go_menu(self):
         if self.sm.current=='game' and self.game_scr.gc:
-            self.game_scr.gc.stop()
+            gc=self.game_scr.gc
+            self.ct=gc.ct
+            self.ski=gc.ski
+            self.ow=gc.ow
+            save(self.ct,self.hs,self.ski,self.ow)
+            gc.stop()
         self.sm.current='menu'
 
     def go_shop(self): self.sm.current='shop'
